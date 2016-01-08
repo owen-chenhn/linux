@@ -708,13 +708,14 @@ static struct request *attempt_merge(struct request_queue *q,
 	 * the merged requests to be the current request
 	 * for accounting purposes.
 	 */
-	if (time_after(req->start_time, next->start_time))
-		req->start_time = next->start_time;
+	if (time_after64(req->start_time_ns, next->start_time_ns))
+		req->start_time_ns = next->start_time_ns;
 
 	req->biotail->bi_next = next->bio;
 	req->biotail = next->biotail;
 
 	req->__data_len += blk_rq_bytes(next);
+	req->__nr_sectors += blk_rq_size(next);
 
 	elv_merge_requests(q, req, next);
 

@@ -68,6 +68,8 @@ enum {
 #include <linux/fs.h>
 #include <linux/workqueue.h>
 
+struct request;
+
 struct partition {
 	unsigned char boot_ind;		/* 0x80 - active */
 	unsigned char head;		/* starting head */
@@ -81,6 +83,10 @@ struct partition {
 	__le32 nr_sects;		/* nr of sectors in partition */
 } __attribute__((packed));
 
+/* Index into the histo arrays */
+#define HISTO_REQUEST   0
+#define HISTO_DMA       1
+
 struct disk_stats {
 	unsigned long sectors[2];	/* READs and WRITEs */
 	unsigned long ios[2];
@@ -88,6 +94,32 @@ struct disk_stats {
 	unsigned long ticks[2];
 	unsigned long io_ticks;
 	unsigned long time_in_queue;
+#ifdef CONFIG_BLOCK_HISTOGRAM
+	/*
+	 * The block_histogram code implements a 2-variable histogram, with
+	 * transfers tracked by transfer size and completion time. The /sysfs
+	 * files are
+	 * /sysfs/block/DEV/PART/read_request_histo,
+	 * /sysfs/block/DEV/PART/write_request_histo,
+	 * /sysfs/block/DEV/PART/read_dma_histo,
+	 * /sysfs/block/DEV/PART/write_dma_histo,
+	 * /sysfs/block/DEV/PART/seek_histo and the
+	 * /sysfs/block/DEV counterparts.
+	 *
+	 * The *request_histo files measure time from when the request is first
+	 * submitted into the drive's queue.  The *dma_histo files measure time
+	 * from when the request is transferred from the queue to the device.
+	 *
+	 * Management requests are tracked by completion time only. The /sysfs
+	 * files are
+	 * /sysfs/block/DEV/PART/management_request_histo,
+	 * /sysfs/block/DEV/PART/management_dma_histo
+	 */
+	int rd_histo[2][CONFIG_HISTO_SIZE_BUCKETS][CONFIG_HISTO_TIME_BUCKETS];
+	int wr_histo[2][CONFIG_HISTO_SIZE_BUCKETS][CONFIG_HISTO_TIME_BUCKETS];
+	int seek_histo[CONFIG_HISTO_SEEK_BUCKETS + 1];
+	int management_histo[2][CONFIG_HISTO_TIME_BUCKETS];
+#endif
 };
 
 #define PARTITION_META_INFO_VOLNAMELTH	64
@@ -120,12 +152,19 @@ struct hd_struct {
 #ifdef CONFIG_FAIL_MAKE_REQUEST
 	int make_it_fail;
 #endif
-	unsigned long stamp;
+	unsigned long long stamp;
 	atomic_t in_flight[2];
 #ifdef	CONFIG_SMP
 	struct disk_stats __percpu *dkstats;
 #else
 	struct disk_stats dkstats;
+#endif
+#ifdef CONFIG_BLOCK_HISTOGRAM
+	sector_t last_end_sector;
+	int base_histo_size;
+	int base_histo_time;
+	int histo_time_scale;
+	int base_histo_seek;
 #endif
 	struct percpu_ref ref;
 	struct rcu_head rcu_head;
@@ -412,6 +451,77 @@ extern void disk_block_events(struct gendisk *disk);
 extern void disk_unblock_events(struct gendisk *disk);
 extern void disk_flush_events(struct gendisk *disk, unsigned int mask);
 extern unsigned int disk_clear_events(struct gendisk *disk, unsigned int mask);
+
+#ifdef	CONFIG_BLOCK_HISTOGRAM
+extern const int base_histo_size;
+extern const int base_histo_time;
+extern const int histo_time_scale;
+extern const int base_histo_seek;
+
+extern void block_histogram_completion(int cpu, struct hd_struct *part,
+			struct request *req, unsigned long long now,
+			int management);
+extern void __block_histogram_completion(int cpu,
+					 struct hd_struct *part,
+					 sector_t sectors,
+					 sector_t end_sector,
+					 int write,
+					 unsigned long long nanos,
+					 unsigned long long nanos_dma);
+void __management_histogram_completion(int cpu,
+				       struct hd_struct *part,
+				       unsigned long long time,
+				       unsigned long long time_dma);
+extern ssize_t part_read_request_histo_show(struct device *dev,
+			struct device_attribute *attr, char *page);
+extern ssize_t part_read_dma_histo_show(struct device *dev,
+			struct device_attribute *attr, char *page);
+extern ssize_t part_write_request_histo_show(struct device *dev,
+			struct device_attribute *attr, char *page);
+extern ssize_t part_write_dma_histo_show(struct device *dev,
+			struct device_attribute *attr, char *page);
+extern ssize_t part_write_dma_histo_show(struct device *dev,
+			struct device_attribute *attr, char *page);
+extern ssize_t part_seek_histo_show(struct device *dev,
+			struct device_attribute *attr, char *page);
+extern ssize_t part_management_request_histo_show(struct device *dev,
+			struct device_attribute *attr, char *page);
+extern ssize_t part_management_dma_histo_show(struct device *dev,
+			struct device_attribute *attr, char *page);
+extern ssize_t part_read_histo_clear(struct device *dev,
+		struct device_attribute *attr, const char *page, size_t count);
+extern ssize_t part_write_histo_clear(struct device *dev,
+		struct device_attribute *attr, const char *page, size_t count);
+extern ssize_t part_seek_histo_clear(struct device *dev,
+		struct device_attribute *attr, const char *page, size_t count);
+extern ssize_t part_management_histo_clear(struct device *dev,
+		struct device_attribute *attr, const char *page, size_t count);
+
+extern void init_part_histo_defaults(struct hd_struct *part);
+
+extern ssize_t part_base_histo_size_show(struct device *dev,
+			struct device_attribute *attr, char *page);
+extern ssize_t part_base_histo_time_show(struct device *dev,
+			struct device_attribute *attr, char *page);
+extern ssize_t part_histo_time_scale_show(struct device *dev,
+			struct device_attribute *attr, char *page);
+extern ssize_t part_base_histo_seek_show(struct device *dev,
+			struct device_attribute *attr, char *page);
+extern ssize_t part_base_histo_size_write(struct device *dev,
+		struct device_attribute *attr, const char *page, size_t count);
+extern ssize_t part_base_histo_time_write(struct device *dev,
+		struct device_attribute *attr, const char *page, size_t count);
+extern ssize_t part_histo_time_scale_write(struct device *dev,
+		struct device_attribute *attr, const char *page, size_t count);
+extern ssize_t part_base_histo_seek_write(struct device *dev,
+		struct device_attribute *attr, const char *page, size_t count);
+extern int stats_time_bucket(unsigned long long nanos, int base_histo_time);
+extern int stats_time_bucket_ns(int ns, int base_histo_time);
+extern int stats_size_bucket(sector_t sectors, int base_histo_size);
+#else
+#define block_histogram_completion(cpu, part, req, now, management)
+#define init_part_histo_defaults(part)
+#endif
 
 /* drivers/char/random.c */
 extern void add_disk_randomness(struct gendisk *disk) __latent_entropy;

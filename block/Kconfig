@@ -190,6 +190,41 @@ source "block/partitions/Kconfig"
 
 endmenu
 
+config BLOCK_HISTOGRAM
+	bool "Performance histogram data"
+	default n
+	---help---
+	  This option causes block devices to collect statistics on transfer
+	  sizes and times.  Useful for performance-tuning a system.  Creates
+	  entries in /sysfs/block/.
+
+	  If you are unsure, say N here.
+
+config HISTO_SIZE_BUCKETS
+	int "Number of size buckets in histogram"
+	depends on BLOCK_HISTOGRAM
+	default "10"
+	---help---
+	  This option controls how many buckets are used to collect
+	  transfer size statistics.
+
+config HISTO_TIME_BUCKETS
+	int "Number of time buckets in histogram"
+	depends on BLOCK_HISTOGRAM
+	default "11"
+	---help---
+	  This option controls how many buckets are used to collect
+	  transfer time statistics.
+
+config HISTO_SEEK_BUCKETS
+	int "Number of seek buckets in histogram"
+	depends on BLOCK_HISTOGRAM
+	default "28"
+	---help---
+	  This option controls how many buckets are used to collect
+	  disk seek statistics. The actual number of buckets is 1 greater
+	  than the number specified here as the last bucket is a catch-all one.
+
 endif # BLOCK
 
 config BLOCK_COMPAT

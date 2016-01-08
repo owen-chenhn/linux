@@ -18,6 +18,11 @@ int get_itimerspec64(struct itimerspec64 *it,
 int put_itimerspec64(const struct itimerspec64 *it,
 			struct itimerspec __user *uit);
 
+static inline unsigned int nsecs_to_msecs(unsigned long long time)
+{
+	return time / NSEC_PER_MSEC;
+}
+
 extern time64_t mktime64(const unsigned int year, const unsigned int mon,
 			const unsigned int day, const unsigned int hour,
 			const unsigned int min, const unsigned int sec);

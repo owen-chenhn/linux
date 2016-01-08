@@ -1105,6 +1105,31 @@ static DEVICE_ATTR(stat, S_IRUGO, part_stat_show, NULL);
 static DEVICE_ATTR(inflight, S_IRUGO, part_inflight_show, NULL);
 static DEVICE_ATTR(badblocks, S_IRUGO | S_IWUSR, disk_badblocks_show,
 		disk_badblocks_store);
+#ifdef	CONFIG_BLOCK_HISTOGRAM
+static DEVICE_ATTR(read_request_histo, S_IRUGO | S_IWUSR,
+		part_read_request_histo_show, part_read_histo_clear);
+static DEVICE_ATTR(read_dma_histo, S_IRUGO | S_IWUSR, part_read_dma_histo_show,
+		part_read_histo_clear);
+static DEVICE_ATTR(write_request_histo, S_IRUGO | S_IWUSR,
+		part_write_request_histo_show, part_write_histo_clear);
+static DEVICE_ATTR(write_dma_histo, S_IRUGO | S_IWUSR,
+		part_write_dma_histo_show, part_write_histo_clear);
+static DEVICE_ATTR(seek_histo, S_IRUGO | S_IWUSR,
+		part_seek_histo_show, part_seek_histo_clear);
+static DEVICE_ATTR(management_dma_histo, S_IRUGO | S_IWUSR,
+		part_management_dma_histo_show, part_management_histo_clear);
+static DEVICE_ATTR(management_request_histo, S_IRUGO | S_IWUSR,
+		part_management_request_histo_show,
+		part_management_histo_clear);
+static DEVICE_ATTR(base_histo_size, S_IRUGO | S_IWUSR,
+		part_base_histo_size_show, part_base_histo_size_write);
+static DEVICE_ATTR(base_histo_time, S_IRUGO | S_IWUSR,
+		part_base_histo_time_show, part_base_histo_time_write);
+static DEVICE_ATTR(histo_time_scale, S_IRUGO | S_IWUSR,
+		part_histo_time_scale_show, part_histo_time_scale_write);
+static DEVICE_ATTR(base_histo_seek, S_IRUGO | S_IWUSR,
+		part_base_histo_seek_show, part_base_histo_seek_write);
+#endif
 #ifdef CONFIG_FAIL_MAKE_REQUEST
 static struct device_attribute dev_attr_fail =
 	__ATTR(make-it-fail, S_IRUGO|S_IWUSR, part_fail_show, part_fail_store);
@@ -1128,6 +1153,19 @@ static struct attribute *disk_attrs[] = {
 	&dev_attr_stat.attr,
 	&dev_attr_inflight.attr,
 	&dev_attr_badblocks.attr,
+#ifdef CONFIG_BLOCK_HISTOGRAM
+	&dev_attr_read_request_histo.attr,
+	&dev_attr_read_dma_histo.attr,
+	&dev_attr_write_request_histo.attr,
+	&dev_attr_write_dma_histo.attr,
+	&dev_attr_seek_histo.attr,
+	&dev_attr_management_request_histo.attr,
+	&dev_attr_management_dma_histo.attr,
+	&dev_attr_base_histo_size.attr,
+	&dev_attr_base_histo_time.attr,
+	&dev_attr_histo_time_scale.attr,
+	&dev_attr_base_histo_seek.attr,
+#endif
 #ifdef CONFIG_FAIL_MAKE_REQUEST
 	&dev_attr_fail.attr,
 #endif
@@ -1307,14 +1345,14 @@ static int diskstats_show(struct seq_file *seqf, void *v)
 			   part_stat_read(hd, ios[READ]),
 			   part_stat_read(hd, merges[READ]),
 			   part_stat_read(hd, sectors[READ]),
-			   jiffies_to_msecs(part_stat_read(hd, ticks[READ])),
+			   nsecs_to_msecs(part_stat_read(hd, ticks[READ])),
 			   part_stat_read(hd, ios[WRITE]),
 			   part_stat_read(hd, merges[WRITE]),
 			   part_stat_read(hd, sectors[WRITE]),
-			   jiffies_to_msecs(part_stat_read(hd, ticks[WRITE])),
+			   nsecs_to_msecs(part_stat_read(hd, ticks[WRITE])),
 			   inflight[0],
-			   jiffies_to_msecs(part_stat_read(hd, io_ticks)),
-			   jiffies_to_msecs(part_stat_read(hd, time_in_queue))
+			   nsecs_to_msecs(part_stat_read(hd, io_ticks)),
+			   nsecs_to_msecs(part_stat_read(hd, time_in_queue))
 			);
 	}
 	disk_part_iter_exit(&piter);
@@ -1411,6 +1449,7 @@ struct gendisk *__alloc_disk_node(int minors, int node_id)
 		}
 		ptbl = rcu_dereference_protected(disk->part_tbl, 1);
 		rcu_assign_pointer(ptbl->part[0], &disk->part0);
+		init_part_histo_defaults(&disk->part0);
 
 		/*
 		 * set_capacity() and get_capacity() currently don't use
@@ -1524,6 +1563,585 @@ int invalidate_partition(struct gendisk *disk, int partno)
 }
 
 EXPORT_SYMBOL(invalidate_partition);
+
+#ifdef	CONFIG_BLOCK_HISTOGRAM
+
+/* Smallest transfer size identifiable (in sectors) by histograms. */
+const int base_histo_size = 4;
+/* Smallest transfer time identifiable (in nanoseconds) by histograms. */
+const int base_histo_time = 10 * NSEC_PER_MSEC;
+/* Transfer time scaling factor. Transfer time is measured in nanoseconds
+ * internally. When printing the histogram, buckets are divided by this factor.
+ * So if the unit factor is 1000000, the histogram will print in milliseconds,
+ * and if it is 1000 it will print in microseconds.
+ */
+const int histo_time_scale = NSEC_PER_MSEC;
+/* Smallest seek distance identifiable (in log base 2 sectors). */
+const int base_histo_seek = 3;
+
+typedef void (part_histo_reset) (struct disk_stats *, int);
+
+/*
+ * Clear one per-cpu instance of one channel of I/O histogram
+ */
+static inline void __block_part_histogram_reset(struct disk_stats *stats,
+						int cmd)
+{
+	if (cmd == READ)
+		memset(&stats->rd_histo, 0, sizeof(stats->rd_histo));
+	else
+		memset(&stats->wr_histo, 0, sizeof(stats->wr_histo));
+}
+
+static inline void __block_part_seek_histogram_reset(struct disk_stats *stats,
+						     int dummy)
+{
+	memset(&stats->seek_histo, 0, sizeof(stats->seek_histo));
+}
+
+static inline void __block_part_management_histogram_reset(
+	struct disk_stats *stats, int dummy)
+{
+	memset(&stats->management_histo, 0, sizeof(stats->management_histo));
+}
+
+/*
+ * Clear one channel of I/O histogram
+ */
+static void block_part_histogram_reset(struct hd_struct *part,
+					part_histo_reset *reset_fn, int cmd)
+{
+#ifdef	CONFIG_SMP
+	int i;
+
+	part_stat_lock();
+	for_each_possible_cpu(i)
+		reset_fn(per_cpu_ptr(part->dkstats, i), cmd);
+#else
+	part_stat_lock();
+	reset_fn(&part.dkstats, cmd);
+#endif
+	part_stat_unlock();
+}
+
+/*
+ * Iterate though all parts of the disk and clear the specified channel of the
+ * histogram.
+ */
+static int block_disk_histogram_reset(struct hd_struct *part,
+					part_histo_reset *reset_fn, int cmd)
+{
+	struct disk_part_iter piter;
+	struct gendisk *disk = part_to_disk(part);
+	struct hd_struct *temp;
+
+	if (!disk)
+		return -ENODEV;
+
+	disk_part_iter_init(&piter, disk, DISK_PITER_INCL_EMPTY_PART0);
+	while ((temp = disk_part_iter_next(&piter)))
+		block_part_histogram_reset(temp, reset_fn, cmd);
+
+	disk_part_iter_exit(&piter);
+	return 0;
+}
+
+void init_part_histo_defaults(struct hd_struct *part)
+{
+	part->last_end_sector = part->start_sect;
+	part->base_histo_size = base_histo_size;
+	part->base_histo_time = base_histo_time;
+	part->histo_time_scale = histo_time_scale;
+	part->base_histo_seek = base_histo_seek;
+}
+
+/*
+ * Map transfer time to histogram bucket. This also uses an exponential
+ * increment, but we like the 1,2,5,10,20,50 progression. Transfer time
+ * is measured in nanoseconds.
+ */
+inline int stats_time_bucket(unsigned long long nanos,
+			     int base_histo_time)
+{
+	int i;
+	unsigned long long t = base_histo_time;
+
+	for (i = 0;; t *= 10) {
+		if (++i >= CONFIG_HISTO_TIME_BUCKETS || nanos <= t)
+			return i - 1;
+		if (++i >= CONFIG_HISTO_TIME_BUCKETS || nanos <= t*2)
+			return i - 1;
+		if (++i >= CONFIG_HISTO_TIME_BUCKETS || nanos <= t*5)
+			return i - 1;
+	}
+}
+
+/*
+ * Map seek distance to histogram bucket. This also uses an exponential
+ * increment : 8, 16, 32, ... sectors.
+ */
+static inline int stats_seek_bucket(sector_t distance, int base_histo_seek)
+{
+	return min(fls64(distance >> base_histo_seek),
+			CONFIG_HISTO_SEEK_BUCKETS);
+}
+
+/*
+ * Map transfer size to histogram bucket.  Transfer sizes are exponentially
+ * increasing. For example: 4, 8, 16, ... sectors.
+ */
+int stats_size_bucket(sector_t sectors, int base_histo_size)
+{
+	int i;
+	/* To make sure bucket for x bytes captures all IOs <= x bytes. */
+	--sectors;
+	WARN_ON(!base_histo_size);
+	do_div(sectors, base_histo_size);
+	if (sectors >= (1 << (CONFIG_HISTO_SIZE_BUCKETS - 2)))
+		return CONFIG_HISTO_SIZE_BUCKETS - 1;
+
+	for (i = 0; sectors > 0; ++i, sectors /= 2)
+		;
+	return i;
+}
+
+/*
+ * Update {read,write}_{dma,request}_histo and seek_histo.
+ *
+ * @part:       disk device partition
+ * @sectors:    request size
+ * @end_sector: end sector of request, for seek histogram. The flash driver
+ *              passes 0, which is a special value to skip updating the seek
+ *              histogram.
+ * @write:      0 if request is a read, anything else if it's a write
+ * @nanos:      total request time
+ * @nanos_dma:  I/O service time
+ *
+ * Time is measured in tens of microseconds when this function is called by
+ * the flash driver. Otherwise it is in milliseconds.
+ */
+void __block_histogram_completion(int cpu,
+				  struct hd_struct *part,
+				  sector_t sectors,
+				  sector_t end_sector,
+				  int write,
+				  unsigned long long nanos,
+				  unsigned long long nanos_dma)
+{
+	sector_t distance, start_sector;
+	int size_idx, req_time_idx, dma_time_idx, seek_idx;
+
+	if (end_sector > 0) {
+		start_sector = end_sector - sectors;
+		if (start_sector >= part->last_end_sector)
+			distance = start_sector - part->last_end_sector;
+		else
+			distance = part->last_end_sector - start_sector;
+
+		seek_idx = stats_seek_bucket(distance, part->base_histo_seek);
+		part_stat_inc(cpu, part, seek_histo[seek_idx]);
+		part->last_end_sector = end_sector;
+	}
+
+	size_idx = stats_size_bucket(sectors, part->base_histo_size);
+	req_time_idx = stats_time_bucket(nanos, part->base_histo_time);
+	if (write)
+		part_stat_inc(cpu, part,
+			wr_histo[HISTO_REQUEST][size_idx][req_time_idx]);
+	else
+		part_stat_inc(cpu, part,
+			rd_histo[HISTO_REQUEST][size_idx][req_time_idx]);
+
+	dma_time_idx = stats_time_bucket(nanos_dma, part->base_histo_time);
+	if (write)
+		part_stat_inc(cpu, part,
+			wr_histo[HISTO_DMA][size_idx][dma_time_idx]);
+	else
+		part_stat_inc(cpu, part,
+			rd_histo[HISTO_DMA][size_idx][dma_time_idx]);
+}
+EXPORT_SYMBOL_GPL(__block_histogram_completion);
+
+/*
+ * Update management_{request,dma}_histo.
+ *
+ * @part:       disk device partition
+ * @nanos:       total request time
+ * @nanos_dma:   I/O service time
+ *
+ * Time is in per-device units; milliseconds for disks and microseconds for
+ * elephants.
+ */
+void __management_histogram_completion(int cpu,
+				       struct hd_struct *part,
+				       unsigned long long nanos,
+				       unsigned long long nanos_dma)
+{
+	int req_time_idx, dma_time_idx;
+
+	req_time_idx = stats_time_bucket(nanos, part->base_histo_time);
+	part_stat_inc(cpu, part, management_histo[HISTO_REQUEST][req_time_idx]);
+	dma_time_idx = stats_time_bucket(nanos_dma, part->base_histo_time);
+	part_stat_inc(cpu, part, management_histo[HISTO_DMA][dma_time_idx]);
+}
+EXPORT_SYMBOL_GPL(__management_histogram_completion);
+
+/*
+ * Helper function: Calls block_histogram_completion after a dma interrupt.
+ * Should be called between part_stat_lock() and part_stat_unlock() calls.
+ */
+void block_histogram_completion(int cpu, struct hd_struct *part,
+		struct request *req, unsigned long long now,
+		int management)
+{
+	static int count = 20000;
+
+	if (req->io_start_time_ns == 0) {
+		if (!(req->cmd_flags & RQF_SOFTBARRIER) && count > 0) {
+			pr_debug("%s: unexpected transfer w/out start time\n",
+				part_to_disk(part)->disk_name);
+			--count;
+		}
+	} else {
+		unsigned long long rq_elapsed = 0, io_elapsed = 0;
+
+		if (time_after64(now, req->start_time_ns))
+			rq_elapsed = now - req->start_time_ns;
+		if (time_after64(now, req->io_start_time_ns))
+			io_elapsed = now - req->io_start_time_ns;
+		if (likely(!management)) {
+			__block_histogram_completion(cpu, part,
+						blk_rq_size(req),
+						blk_rq_pos(req),
+						(op_is_write(req_op(req))),
+						rq_elapsed,
+						io_elapsed);
+		} else {
+			__management_histogram_completion(cpu, part,
+							  rq_elapsed,
+							  io_elapsed);
+		}
+	}
+}
+
+/*
+ * Tiny helper utility, append sprintf() output to a buffer, update pointers,
+ * and guard against overflow.
+ */
+static inline void sysfs_out(char **ptr, ssize_t *rem, const char *fmt, ...)
+{
+	va_list	ap;
+	int	i;
+
+	va_start(ap, fmt);
+	i = vsnprintf(*ptr, *rem, fmt, ap);
+	*ptr += i;
+	*rem -= i;
+	va_end(ap);
+}
+
+/*
+ * For some reason, part_stat_read() doesn't work well using
+ * rd_histo[type][i][j] or seek_histo[i] as the second argument.
+ */
+#ifdef CONFIG_SMP
+
+#define histo_read_1d(part, histo, i)					\
+({									\
+	int cpu, res = 0;						\
+	for_each_possible_cpu(cpu)					\
+		res += per_cpu_ptr(part->dkstats, cpu)->histo[i];	\
+	res;								\
+})
+
+#define histo_read_2d(part, histo, i, j)				\
+({									\
+	int cpu, res = 0;						\
+	for_each_possible_cpu(cpu)					\
+		res += per_cpu_ptr(part->dkstats, cpu)->histo[i][j];	\
+	res;								\
+})
+
+#define histo_read_3d(part, histo, i, j, k)				\
+({									\
+	int cpu, res = 0;						\
+	for_each_possible_cpu(cpu)					\
+		res += per_cpu_ptr(part->dkstats, cpu)->histo[i][j][k];	\
+	res;								\
+})
+
+#else /* !CONFIG_SMP */
+
+#define histo_read_1d(part, histo, i)		(part->dkstats.histo[i])
+#define histo_read_2d(part, histo, i, j)	(part->dkstats.histo[i][j])
+#define histo_read_3d(part, histo, i, j, k)	(part->dkstats.histo[i][j][k])
+
+#endif
+
+static const char *histo_time_string(struct hd_struct *part)
+{
+	switch (part->histo_time_scale) {
+	case NSEC_PER_MSEC:
+		return "ms";
+	case NSEC_PER_USEC:
+		return "us";
+	default:
+		return "unknown";
+	}
+}
+
+/*
+ * Dumps the specified 'type' of histogram for part to out.
+ * The result must be less than PAGE_SIZE.
+ */
+static int dump_histo(struct hd_struct *part, int cmd, int type, char *page)
+{
+	ssize_t	rem = PAGE_SIZE;
+	char *optr = page;
+	int i, j, len, value, size = part->base_histo_size * 512;
+	unsigned long long nanos;
+	static const int mults[3] = {1, 2, 5};
+
+	/*
+	 * Documentation/filesystems/sysfs.txt strongly discourages the use of
+	 * any kind of fancy formatting here. We *are* emitting an array, so
+	 * there needs to be some amount of formatting.
+	 */
+
+	/* Key */
+	len = snprintf(page, rem, "rows = bytes columns = %s\n",
+			histo_time_string(part));
+	page += len;
+	rem -= len;
+
+	/* Row header */
+	len = snprintf(page, rem, "       ");
+	page += len;
+	rem -= len;
+	for (i = 0, nanos = part->base_histo_time;
+	     i < CONFIG_HISTO_TIME_BUCKETS;
+	     nanos *= 10) {
+		for (j = 0; j < 3 && i < CONFIG_HISTO_TIME_BUCKETS; ++j, ++i) {
+			len = snprintf(page, rem, "\t%llu",
+				       nanos * mults[j] /
+				       part->histo_time_scale);
+			page += len;
+			rem -= len;
+		}
+	}
+	len = snprintf(page, rem, "\n");
+	page += len;
+	rem -= len;
+
+	/* Payload */
+	for (i = 0; i < CONFIG_HISTO_SIZE_BUCKETS; i++, size *= 2) {
+		len = snprintf(page, rem, "%7d", size);
+		page += len;
+		rem -= len;
+		for (j = 0; j < CONFIG_HISTO_TIME_BUCKETS; j++) {
+			value = (cmd == READ) ?
+				histo_read_3d(part, rd_histo, type, i, j) :
+				histo_read_3d(part, wr_histo, type, i, j);
+			len = snprintf(page, rem, "\t%d", value);
+			page += len;
+			rem -= len;
+		}
+		len = snprintf(page, rem, "\n");
+		page += len;
+		rem -= len;
+	}
+	return page - optr;
+}
+
+/*
+ * Dumps the seek histogram for part. The result must be less than PAGE_SIZE.
+ */
+static int dump_seek_histo(struct hd_struct *part, char *page)
+{
+	ssize_t rem = PAGE_SIZE;
+	char *optr = page;
+	int i, len;
+
+	len = snprintf(page, rem, "sectors\tnumber\n");
+	page += len;
+	rem -= len;
+
+	for (i = 0; i < CONFIG_HISTO_SEEK_BUCKETS + 1; i++) {
+		if (i < CONFIG_HISTO_SEEK_BUCKETS)
+			len = snprintf(page, rem, "%ld\t%d\n",
+				1UL << (i + part->base_histo_seek),
+				histo_read_1d(part, seek_histo, i));
+		else
+			len = snprintf(page, rem, "inf\t%d\n",
+					histo_read_1d(part, seek_histo, i));
+		page += len;
+		rem -= len;
+	}
+	return page - optr;
+}
+
+/*
+ * Dumps the management command histogram for part. The result must be less than
+ * PAGE_SIZE.
+ */
+static int dump_management_histo(struct hd_struct *part, int type, char *page)
+{
+	ssize_t rem = PAGE_SIZE;
+	char *optr = page;
+	int i, j, len, value;
+	unsigned long long nanos;
+	static const int mults[3] = {1, 2, 5};
+
+	len = snprintf(page, rem, "%s\tnumber\n", histo_time_string(part));
+	page += len;
+	rem -= len;
+
+	for (i = 0, nanos = part->base_histo_time;
+	     i < CONFIG_HISTO_TIME_BUCKETS;
+	     nanos *= 10) {
+		for (j = 0; j < 3 && i < CONFIG_HISTO_TIME_BUCKETS; ++j, ++i) {
+			value = histo_read_2d(part, management_histo, type, i);
+			len = snprintf(page, rem, "%lld\t%d\n",
+			       nanos * mults[j] / part->histo_time_scale,
+			       value);
+			page += len;
+			rem -= len;
+		}
+	}
+
+	return page - optr;
+}
+
+/*
+ * sysfs show() methods for the seven histogram channels.
+ */
+ssize_t part_read_request_histo_show(struct device *dev,
+			struct device_attribute *attr, char *page)
+{
+	return dump_histo(dev_to_part(dev), READ, HISTO_REQUEST, page);
+}
+
+ssize_t part_read_dma_histo_show(struct device *dev,
+			struct device_attribute *attr, char *page)
+{
+	return dump_histo(dev_to_part(dev), READ, HISTO_DMA, page);
+}
+
+ssize_t part_write_request_histo_show(struct device *dev,
+			struct device_attribute *attr, char *page)
+{
+	return dump_histo(dev_to_part(dev), WRITE, HISTO_REQUEST, page);
+}
+
+ssize_t part_write_dma_histo_show(struct device *dev,
+			struct device_attribute *attr, char *page)
+{
+	return dump_histo(dev_to_part(dev), WRITE, HISTO_DMA, page);
+}
+
+ssize_t part_seek_histo_show(struct device *dev,
+			struct device_attribute *attr, char *page)
+{
+	return dump_seek_histo(dev_to_part(dev), page);
+}
+
+ssize_t part_management_request_histo_show(struct device *dev,
+			struct device_attribute *attr, char *page)
+{
+	return dump_management_histo(dev_to_part(dev), HISTO_REQUEST, page);
+}
+
+ssize_t part_management_dma_histo_show(struct device *dev,
+			struct device_attribute *attr, char *page)
+{
+	return dump_management_histo(dev_to_part(dev), HISTO_DMA, page);
+}
+
+/*
+ * Reinitializes the read histograms to 0.
+ */
+ssize_t part_read_histo_clear(struct device *dev,
+		struct device_attribute *attr, const char *page, size_t count)
+{
+	/* Ignore the data, just clear the histogram */
+	int retval = block_disk_histogram_reset(dev_to_part(dev),
+					__block_part_histogram_reset, READ);
+	return (retval == 0 ? count : retval);
+}
+
+/*
+ * Reinitializes the write histograms to 0.
+ */
+ssize_t part_write_histo_clear(struct device *dev,
+		struct device_attribute *attr, const char *page, size_t count)
+{
+	int retval = block_disk_histogram_reset(dev_to_part(dev),
+					__block_part_histogram_reset, WRITE);
+	return (retval == 0 ? count : retval);
+}
+
+/*
+ * Reinitializes the seek histograms to 0.
+ */
+ssize_t part_seek_histo_clear(struct device *dev,
+		struct device_attribute *attr, const char *page, size_t count)
+{
+	int retval = block_disk_histogram_reset(dev_to_part(dev),
+				__block_part_seek_histogram_reset, 0);
+	return (retval == 0 ? count : retval);
+}
+
+/*
+ * Reinitializes the management command histograms to 0.
+ */
+ssize_t part_management_histo_clear(struct device *dev,
+		struct device_attribute *attr, const char *page, size_t count)
+{
+	int retval = block_disk_histogram_reset(dev_to_part(dev),
+				__block_part_management_histogram_reset, 0);
+	return (retval == 0 ? count : retval);
+}
+
+#define SHOW_BASE_FUNCTION(__VAR)					\
+ssize_t part_##__VAR##_show(struct device *dev,				\
+			struct device_attribute *attr, char *page)	\
+{									\
+	struct hd_struct *part = dev_to_part(dev);			\
+									\
+	return sprintf(page, "%d\n", part->__VAR);			\
+}
+
+SHOW_BASE_FUNCTION(base_histo_size);
+SHOW_BASE_FUNCTION(base_histo_time);
+SHOW_BASE_FUNCTION(histo_time_scale);
+SHOW_BASE_FUNCTION(base_histo_seek);
+#undef SHOW_BASE_FUNCTION
+
+#define WRITE_BASE_FUNCTION(__VAR, MIN, reset_fn)			\
+ssize_t part_##__VAR##_write(struct device *dev,			\
+	struct device_attribute *attr, const char *page, size_t count)	\
+{									\
+	struct hd_struct *part = dev_to_part(dev);			\
+	char *p = (char *)page;						\
+	unsigned long __data;						\
+	int ret = kstrtoul(p, 10, &__data);				\
+									\
+	if (ret)							\
+		return ret;						\
+	part->__VAR = max_t(unsigned long, __data, MIN);		\
+	block_disk_histogram_reset(part, reset_fn, READ);		\
+	block_disk_histogram_reset(part, reset_fn, WRITE);		\
+	return count;							\
+}
+
+WRITE_BASE_FUNCTION(base_histo_size, 1, __block_part_histogram_reset);
+WRITE_BASE_FUNCTION(base_histo_time, 1, __block_part_histogram_reset);
+WRITE_BASE_FUNCTION(histo_time_scale, 1, __block_part_histogram_reset);
+WRITE_BASE_FUNCTION(base_histo_seek, 1, __block_part_seek_histogram_reset);
+#undef WRITE_BASE_FUNCTION
+
+#endif
+
 
 /*
  * Disk events - monitor disk events like media change and eject request.

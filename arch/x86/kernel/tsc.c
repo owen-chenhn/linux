@@ -40,9 +40,10 @@ static int __read_mostly tsc_unstable;
 /* native_sched_clock() is called before tsc_init(), so
    we must start with the TSC soft disabled to prevent
    erroneous rdtsc usage on !boot_cpu_has(X86_FEATURE_TSC) processors */
-static int __read_mostly tsc_disabled = -1;
+int __read_mostly tsc_disabled = -1;
+EXPORT_SYMBOL_GPL(tsc_disabled);
 
-static DEFINE_STATIC_KEY_FALSE(__use_tsc);
+DEFINE_STATIC_KEY_FALSE(__use_tsc);
 
 int tsc_clocksource_reliable;
 
@@ -51,13 +52,8 @@ static u32 art_to_tsc_denominator;
 static u64 art_to_tsc_offset;
 struct clocksource *art_related_clocksource;
 
-struct cyc2ns {
-	struct cyc2ns_data data[2];	/*  0 + 2*16 = 32 */
-	seqcount_t	   seq;		/* 32 + 4    = 36 */
-
-}; /* fits one cacheline */
-
-static DEFINE_PER_CPU_ALIGNED(struct cyc2ns, cyc2ns);
+DEFINE_PER_CPU_ALIGNED(struct cyc2ns, cyc2ns);
+EXPORT_SYMBOL_GPL(cyc2ns);
 
 void cyc2ns_read_begin(struct cyc2ns_data *data)
 {
@@ -122,21 +118,6 @@ static void __init cyc2ns_init(int cpu)
 	seqcount_init(&c2n->seq);
 }
 
-static inline unsigned long long cycles_2_ns(unsigned long long cyc)
-{
-	struct cyc2ns_data data;
-	unsigned long long ns;
-
-	cyc2ns_read_begin(&data);
-
-	ns = data.cyc2ns_offset;
-	ns += mul_u64_u32_shr(cyc, data.cyc2ns_mul, data.cyc2ns_shift);
-
-	cyc2ns_read_end();
-
-	return ns;
-}
-
 static void set_cyc2ns_scale(unsigned long khz, int cpu, unsigned long long tsc_now)
 {
 	unsigned long long ns_now;
@@ -191,24 +172,7 @@ done:
  */
 u64 native_sched_clock(void)
 {
-	if (static_branch_likely(&__use_tsc)) {
-		u64 tsc_now = rdtsc();
-
-		/* return the value in ns */
-		return cycles_2_ns(tsc_now);
-	}
-
-	/*
-	 * Fall back to jiffies if there's no TSC available:
-	 * ( But note that we still use it if the TSC is marked
-	 *   unstable. We do this because unlike Time Of Day,
-	 *   the scheduler clock tolerates small errors and it's
-	 *   very important for it to be as fast as the platform
-	 *   can achieve it. )
-	 */
-
-	/* No locking but a rare wrong value is not a big deal: */
-	return (jiffies_64 - INITIAL_JIFFIES) * (1000000000 / HZ);
+	return __sched_clock();
 }
 
 /*

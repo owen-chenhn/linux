@@ -150,7 +150,8 @@ struct request {
 
 	unsigned long atomic_flags;
 
-	/* the following two fields are internal, NEVER access directly */
+	/* the following fields are internal, NEVER access directly */
+	sector_t __nr_sectors;		/* Total number of sectors */
 	unsigned int __data_len;	/* total data len */
 	int tag;
 	sector_t __sector;		/* sector cursor */
@@ -205,10 +206,10 @@ struct request {
 	struct hd_struct *part;
 	unsigned long start_time;
 	struct blk_issue_stat issue_stat;
-#ifdef CONFIG_BLK_CGROUP
-	struct request_list *rl;		/* rl this rq is alloced from */
 	unsigned long long start_time_ns;
 	unsigned long long io_start_time_ns;    /* when passed to hardware */
+#ifdef CONFIG_BLK_CGROUP
+	struct request_list *rl;		/* rl this rq is alloced from */
 #endif
 	/* Number of scatter-gather DMA addr+len pairs after
 	 * physical address coalescing is performed.
@@ -1013,6 +1014,7 @@ static inline struct request_queue *bdev_get_queue(struct block_device *bdev)
 
 /*
  * blk_rq_pos()			: the current sector
+ * blk_rq_size()		: the size of the request in sectors
  * blk_rq_bytes()		: bytes left in the entire request
  * blk_rq_cur_bytes()		: bytes left in the current segment
  * blk_rq_err_bytes()		: bytes left till the next error boundary
@@ -1022,6 +1024,11 @@ static inline struct request_queue *bdev_get_queue(struct block_device *bdev)
 static inline sector_t blk_rq_pos(const struct request *rq)
 {
 	return rq->__sector;
+}
+
+static inline sector_t blk_rq_size(const struct request *rq)
+{
+	return rq->__nr_sectors;
 }
 
 static inline unsigned int blk_rq_bytes(const struct request *rq)
@@ -1735,7 +1742,6 @@ int kblockd_schedule_delayed_work(struct delayed_work *dwork, unsigned long dela
 int kblockd_schedule_delayed_work_on(int cpu, struct delayed_work *dwork, unsigned long delay);
 int kblockd_mod_delayed_work_on(int cpu, struct delayed_work *dwork, unsigned long delay);
 
-#ifdef CONFIG_BLK_CGROUP
 /*
  * This should not be using sched_clock(). A real patch is in progress
  * to fix this up, until that is in place we need to disable preemption
@@ -1755,6 +1761,7 @@ static inline void set_io_start_time_ns(struct request *req)
 	preempt_enable();
 }
 
+#if defined(CONFIG_BLK_CGROUP) || defined(CONFIG_BLOCK_HISTOGRAM)
 static inline uint64_t rq_start_time_ns(struct request *req)
 {
         return req->start_time_ns;
@@ -1765,8 +1772,6 @@ static inline uint64_t rq_io_start_time_ns(struct request *req)
         return req->io_start_time_ns;
 }
 #else
-static inline void set_start_time_ns(struct request *req) {}
-static inline void set_io_start_time_ns(struct request *req) {}
 static inline uint64_t rq_start_time_ns(struct request *req)
 {
 	return 0;

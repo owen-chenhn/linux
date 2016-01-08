@@ -129,14 +129,14 @@ ssize_t part_stat_show(struct device *dev,
 		part_stat_read(p, ios[READ]),
 		part_stat_read(p, merges[READ]),
 		(unsigned long long)part_stat_read(p, sectors[READ]),
-		jiffies_to_msecs(part_stat_read(p, ticks[READ])),
+		nsecs_to_msecs(part_stat_read(p, ticks[READ])),
 		part_stat_read(p, ios[WRITE]),
 		part_stat_read(p, merges[WRITE]),
 		(unsigned long long)part_stat_read(p, sectors[WRITE]),
-		jiffies_to_msecs(part_stat_read(p, ticks[WRITE])),
+		nsecs_to_msecs(part_stat_read(p, ticks[WRITE])),
 		inflight[0],
-		jiffies_to_msecs(part_stat_read(p, io_ticks)),
-		jiffies_to_msecs(part_stat_read(p, time_in_queue)));
+		nsecs_to_msecs(part_stat_read(p, io_ticks)),
+		nsecs_to_msecs(part_stat_read(p, time_in_queue)));
 }
 
 ssize_t part_inflight_show(struct device *dev,
@@ -180,6 +180,24 @@ static DEVICE_ATTR(discard_alignment, S_IRUGO, part_discard_alignment_show,
 		   NULL);
 static DEVICE_ATTR(stat, S_IRUGO, part_stat_show, NULL);
 static DEVICE_ATTR(inflight, S_IRUGO, part_inflight_show, NULL);
+#ifdef CONFIG_BLOCK_HISTOGRAM
+static DEVICE_ATTR(read_request_histo, S_IRUGO | S_IWUSR,
+		part_read_request_histo_show, part_read_histo_clear);
+static DEVICE_ATTR(read_dma_histo, S_IRUGO | S_IWUSR, part_read_dma_histo_show,
+		part_read_histo_clear);
+static DEVICE_ATTR(write_request_histo, S_IRUGO | S_IWUSR,
+		part_write_request_histo_show, part_write_histo_clear);
+static DEVICE_ATTR(write_dma_histo, S_IRUGO | S_IWUSR,
+		part_write_dma_histo_show, part_write_histo_clear);
+static DEVICE_ATTR(seek_histo, S_IRUGO | S_IWUSR,
+		part_seek_histo_show, part_seek_histo_clear);
+static DEVICE_ATTR(base_histo_size, S_IRUGO | S_IWUSR,
+		part_base_histo_size_show, part_base_histo_size_write);
+static DEVICE_ATTR(base_histo_time, S_IRUGO | S_IWUSR,
+		part_base_histo_time_show, part_base_histo_time_write);
+static DEVICE_ATTR(base_histo_seek, S_IRUGO | S_IWUSR,
+		part_base_histo_seek_show, part_base_histo_seek_write);
+#endif
 #ifdef CONFIG_FAIL_MAKE_REQUEST
 static struct device_attribute dev_attr_fail =
 	__ATTR(make-it-fail, S_IRUGO|S_IWUSR, part_fail_show, part_fail_store);
@@ -194,6 +212,16 @@ static struct attribute *part_attrs[] = {
 	&dev_attr_discard_alignment.attr,
 	&dev_attr_stat.attr,
 	&dev_attr_inflight.attr,
+#ifdef CONFIG_BLOCK_HISTOGRAM
+	&dev_attr_read_request_histo.attr,
+	&dev_attr_read_dma_histo.attr,
+	&dev_attr_write_request_histo.attr,
+	&dev_attr_write_dma_histo.attr,
+	&dev_attr_seek_histo.attr,
+	&dev_attr_base_histo_size.attr,
+	&dev_attr_base_histo_time.attr,
+	&dev_attr_base_histo_seek.attr,
+#endif
 #ifdef CONFIG_FAIL_MAKE_REQUEST
 	&dev_attr_fail.attr,
 #endif
@@ -330,6 +358,7 @@ struct hd_struct *add_partition(struct gendisk *disk, int partno,
 	p->nr_sects = len;
 	p->partno = partno;
 	p->policy = get_disk_ro(disk);
+	init_part_histo_defaults(p);
 
 	if (info) {
 		struct partition_meta_info *pinfo = alloc_part_info(disk);

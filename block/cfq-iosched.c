@@ -4215,6 +4215,8 @@ static void cfq_completed_request(struct request_queue *q, struct request *rq)
 	struct cfq_data *cfqd = cfqq->cfqd;
 	const int sync = rq_is_sync(rq);
 	u64 now = ktime_get_ns();
+	unsigned long long sched_now = sched_clock();
+	unsigned long long cfq_fifo_expire;
 
 	cfq_log_cfqq(cfqd, cfqq, "complete rqnoidle %d", req_noidle(rq));
 
@@ -4242,16 +4244,10 @@ static void cfq_completed_request(struct request_queue *q, struct request *rq)
 					cfqq_type(cfqq));
 
 		st->ttime.last_end_request = now;
-		/*
-		 * We have to do this check in jiffies since start_time is in
-		 * jiffies and it is not trivial to convert to ns. If
-		 * cfq_fifo_expire[1] ever comes close to 1 jiffie, this test
-		 * will become problematic but so far we are fine (the default
-		 * is 128 ms).
-		 */
-		if (!time_after(rq->start_time +
-				  nsecs_to_jiffies(cfqd->cfq_fifo_expire[1]),
-				jiffies))
+		cfq_fifo_expire = rq->start_time_ns
+		    + (unsigned long long)cfqd->cfq_fifo_expire[1]
+		    * NSEC_PER_MSEC;
+		if (!time_after64(cfq_fifo_expire, sched_now))
 			cfqd->last_delayed_sync = now;
 	}
 

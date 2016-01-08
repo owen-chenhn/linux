@@ -303,7 +303,6 @@ static struct request *blk_mq_rq_ctx_init(struct blk_mq_alloc_data *data,
 	RB_CLEAR_NODE(&rq->rb_node);
 	rq->rq_disk = NULL;
 	rq->part = NULL;
-	rq->start_time = jiffies;
 #ifdef CONFIG_BLK_CGROUP
 	rq->rl = NULL;
 	set_start_time_ns(rq);

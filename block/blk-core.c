@@ -123,7 +123,6 @@ void blk_rq_init(struct request_queue *q, struct request *rq)
 	RB_CLEAR_NODE(&rq->rb_node);
 	rq->tag = -1;
 	rq->internal_tag = -1;
-	rq->start_time = jiffies;
 	set_start_time_ns(rq);
 	rq->part = NULL;
 }
@@ -1566,10 +1565,10 @@ static void add_acct_request(struct request_queue *q, struct request *rq,
 }
 
 static void part_round_stats_single(struct request_queue *q, int cpu,
-				    struct hd_struct *part, unsigned long now,
+				    struct hd_struct *part, unsigned long long now,
 				    unsigned int inflight)
 {
-	if (inflight) {
+	if (inflight & time_after64(now, part->stamp)) {
 		__part_stat_add(cpu, part, time_in_queue,
 				inflight * (now - part->stamp));
 		__part_stat_add(cpu, part, io_ticks, (now - part->stamp));
@@ -1592,12 +1591,12 @@ static void part_round_stats_single(struct request_queue *q, int cpu,
  * second, leading to >100% utilisation.  To deal with that, we call this
  * function to do a round-off before returning the results when reading
  * /proc/diskstats.  This accounts immediately for all queue usage up to
- * the current jiffies and restarts the counters again.
+ * the current ns and restarts the counters again.
  */
 void part_round_stats(struct request_queue *q, int cpu, struct hd_struct *part)
 {
 	struct hd_struct *part2 = NULL;
-	unsigned long now = jiffies;
+	unsigned long long now = sched_clock();
 	unsigned int inflight[2];
 	int stats = 0;
 
@@ -1706,6 +1705,7 @@ bool bio_attempt_back_merge(struct request_queue *q, struct request *req,
 	req->biotail->bi_next = bio;
 	req->biotail = bio;
 	req->__data_len += bio->bi_iter.bi_size;
+	req->__nr_sectors += bio_sectors(bio);
 	req->ioprio = ioprio_best(req->ioprio, bio_prio(bio));
 
 	blk_account_io_start(req, false);
@@ -1730,6 +1730,7 @@ bool bio_attempt_front_merge(struct request_queue *q, struct request *req,
 
 	req->__sector = bio->bi_iter.bi_sector;
 	req->__data_len += bio->bi_iter.bi_size;
+	req->__nr_sectors += bio_sectors(bio);
 	req->ioprio = ioprio_best(req->ioprio, bio_prio(bio));
 
 	blk_account_io_start(req, false);
@@ -2584,7 +2585,7 @@ void blk_account_io_done(struct request *req)
 	 * containing request is enough.
 	 */
 	if (blk_do_io_stat(req) && !(req->rq_flags & RQF_FLUSH_SEQ)) {
-		unsigned long duration = jiffies - req->start_time;
+		unsigned long long now = sched_clock();
 		const int rw = rq_data_dir(req);
 		struct hd_struct *part;
 		int cpu;
@@ -2593,12 +2594,25 @@ void blk_account_io_done(struct request *req)
 		part = req->part;
 
 		part_stat_inc(cpu, part, ios[rw]);
-		part_stat_add(cpu, part, ticks[rw], duration);
+		if (time_after64(now, req->start_time_ns))
+			part_stat_add(cpu, part, ticks[rw],
+					now - req->start_time_ns);
 		part_round_stats(req->q, cpu, part);
+		block_histogram_completion(cpu, part, req, now, 0);
 		part_dec_in_flight(req->q, part, rw);
 
 		hd_struct_put(part);
 		part_stat_unlock();
+	} else if (blk_op_is_scsi(req_op(req)) && req->rq_disk) {
+#ifdef CONFIG_BLOCK_HISTOGRAMS
+		unsigned long long now = sched_clock();
+		struct hd_struct *part;
+		int cpu = part_stat_lock();
+
+		part = &req->rq_disk->part0;
+		block_histogram_completion(cpu, part, req, now, 1);
+		part_stat_unlock();
+#endif
 	}
 }
 
@@ -2822,7 +2836,8 @@ static void blk_dequeue_request(struct request *rq)
 	if (blk_account_rq(rq)) {
 		q->in_flight[rq_is_sync(rq)]++;
 		set_io_start_time_ns(rq);
-	}
+	} else if (blk_op_is_scsi(req_op(rq)) && rq->rq_disk)
+		set_io_start_time_ns(rq);
 }
 
 /**
@@ -3254,6 +3269,7 @@ void blk_rq_bio_prep(struct request_queue *q, struct request *rq,
 
 	rq->__data_len = bio->bi_iter.bi_size;
 	rq->bio = rq->biotail = bio;
+	rq->__nr_sectors = bio_sectors(bio);
 
 	if (bio->bi_disk)
 		rq->rq_disk = bio->bi_disk;
